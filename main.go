@@ -67,13 +67,36 @@ type ConnCtx struct {
 
 // === Message Element Builders ===
 
-// AC Descriptor (Type=2) — isi dummy
-func buildME_ACDescriptor() []byte {
+// ===== Update: Message Element Builders =====
+
+// AC Name (Type=4)
+func buildME_ACName(name string) []byte {
+	b := []byte(name)
+	me := make([]byte, 4+len(b))
+	binary.BigEndian.PutUint16(me[0:2], 4) // Type=4
+	binary.BigEndian.PutUint16(me[2:4], uint16(len(b)))
+	copy(me[4:], b)
+	return me
+}
+
+func buildME_ACDescriptorBetter() []byte {
+	soft := []byte("LiteOn-AC-1.0")
+	hard := []byte("LiteOn-HW")
+
 	var v bytes.Buffer
-	v.Write([]byte{0x00, 0x01})             // Station Limit
-	v.Write([]byte{0x00, 0x01})             // Active WTPs
-	v.Write([]byte{0x00, 0x00, 0x00, 0x00}) // reserved/flags
-	v.Write([]byte{0x00, 0x00, 0x00, 0x00}) // HW/SW version dummy
+	v.Write([]byte{0x00, 0x10}) // Stations=16
+	v.Write([]byte{0x01, 0x00}) // StationLimit=256
+	v.Write([]byte{0x00, 0x01}) // ActiveWTPs=1
+	v.Write([]byte{0x00, 0x80}) // MaxWTPs=128
+	v.Write([]byte{0x00, 0x00}) // Security flags
+	v.Write([]byte{0x00, 0x00}) // R-MAC present
+	v.Write([]byte{0x00, 0x00}) // Reserved
+
+	v.Write([]byte{0x00, byte(len(soft))})
+	v.Write(soft)
+	v.Write([]byte{0x00, byte(len(hard))})
+	v.Write(hard)
+
 	me := make([]byte, 4+v.Len())
 	binary.BigEndian.PutUint16(me[0:2], 2) // Type=2
 	binary.BigEndian.PutUint16(me[2:4], uint16(v.Len()))
@@ -81,16 +104,47 @@ func buildME_ACDescriptor() []byte {
 	return me
 }
 
-// AC IPv4 Address (Type=3)
-func buildME_ACIPv4(addr net.IP) []byte {
-	ip4 := addr.To4()
-	if ip4 == nil {
-		ip4 = net.IPv4(0, 0, 0, 0)
+func buildDiscoveryResponse(seq uint8, little bool, acIP net.IP) []byte {
+	me2 := buildME_ACDescriptorBetter()
+	me4 := buildME_ACName("LiteOn-FakeAC")
+	me3 := buildME_ACIPv4List(acIP) // <-- LIST (ada Count)
+	me16 := buildME_DTLSPolicy()
+
+	msgElems := append([]byte{}, me2...)
+	msgElems = append(msgElems, me4...)
+	msgElems = append(msgElems, me3...)
+	msgElems = append(msgElems, me16...)
+
+	hdr := buildCapwapPreambleHeader8() // <-- header 8B dengan Type/Version benar
+	ctrl := buildControlHeader(MT_DISCOVERY_RESP, seq, uint16(len(msgElems)), little)
+
+	pkt := append(hdr, ctrl...)
+	pkt = append(pkt, msgElems...)
+	return pkt
+}
+
+func buildME_ACIPv4List(addrs ...net.IP) []byte {
+	// ambil v4 saja
+	v4s := make([]net.IP, 0, len(addrs))
+	for _, ip := range addrs {
+		if v4 := ip.To4(); v4 != nil {
+			v4s = append(v4s, v4)
+		}
 	}
-	me := make([]byte, 4+len(ip4))
+	if len(v4s) == 0 {
+		v4s = []net.IP{net.IPv4(0, 0, 0, 0)}
+	}
+	payload := make([]byte, 1+4*len(v4s))
+	payload[0] = byte(len(v4s))
+	off := 1
+	for _, v4 := range v4s {
+		copy(payload[off:off+4], v4.To4())
+		off += 4
+	}
+	me := make([]byte, 4+len(payload))
 	binary.BigEndian.PutUint16(me[0:2], 3) // Type=3
-	binary.BigEndian.PutUint16(me[2:4], uint16(len(ip4)))
-	copy(me[4:], ip4)
+	binary.BigEndian.PutUint16(me[2:4], uint16(len(payload)))
+	copy(me[4:], payload)
 	return me
 }
 
@@ -103,41 +157,11 @@ func buildME_DTLSPolicy() []byte {
 	return me
 }
 
-// Build Discovery Response (msg_type=2) with TLVs
-func buildDiscoveryResponse(seq uint8, little bool, acIP net.IP) []byte {
-	me2 := buildME_ACDescriptor()
-	me3 := buildME_ACIPv4(acIP)
-	me16 := buildME_DTLSPolicy()
-
-	msgElems := append(me2, me3...)
-	msgElems = append(msgElems, me16...)
-
-	hdr := buildCapwapPreambleHeader()
-	ctrl := buildControlHeader(MT_DISCOVERY_RESP, seq, uint16(len(msgElems)), little)
-
-	pkt := append(hdr, ctrl...)
-	pkt = append(pkt, msgElems...)
-	return pkt
-}
-
-// func (c *ConnCtx) nextSeq() uint8 {
-// 	c.seq++
-// 	if c.seq == 0 {
-// 		c.seq = 1
-// 	}
-// 	return c.seq
-// }
-
-// ==== CAPWAP header builders (plaintext) ====
-// Minimal preamble+header mirroring typical plaintext captures.
-// If AP expects different flags/HLEN, you can tweak here.
-func buildCapwapPreambleHeader() []byte {
-	// 12 bytes minimal header often seen in the wild
-	// Byte[0] Version/Type nibble 0x10; Byte[1] HLEN lower 5 bits (here 0x10 -> 4*4=16? but many traces use fixed 12)
-	// For lab purposes keep 12 bytes zeroed except first 2 nibble markers; adjust if needed.
-	h := make([]byte, 12)
-	h[0] = 0x10
-	h[1] = 0x10
+// 8-byte CAPWAP header: Version=0 (high nibble), Type=1 (low nibble), HLEN=2 (8 bytes)
+func buildCapwapPreambleHeader8() []byte {
+	h := make([]byte, 8)
+	h[0] = 0x01 // Version=0, Type=1 (control)
+	h[1] = 0x20 // HLEN=2 (8 bytes / 4)
 	return h
 }
 
@@ -230,7 +254,7 @@ func buildConfigUpdateRequest(seq uint8, little bool, radioID, wlanID uint8, ssi
 
 	msgElems := append(meAdd, meInfo...)
 
-	hdr := buildCapwapPreambleHeader()
+	hdr := buildCapwapPreambleHeader8()
 	ctrl := buildControlHeader(MT_CFGUPDATE_REQ, seq, uint16(len(msgElems)), little)
 
 	pkt := append(hdr, ctrl...)
@@ -240,7 +264,7 @@ func buildConfigUpdateRequest(seq uint8, little bool, radioID, wlanID uint8, ssi
 
 // Minimal “empty body” responses for 2/4/6/10
 func buildSimpleResponse(msgType uint8, seq uint8, little bool) []byte {
-	hdr := buildCapwapPreambleHeader()
+	hdr := buildCapwapPreambleHeader8()
 	ctrl := buildControlHeader(msgType, seq, 0, little)
 	return append(hdr, ctrl...)
 }
@@ -300,11 +324,19 @@ func main() {
 			reply := buildDiscoveryResponse(seq, useLE, net.ParseIP("172.16.1.1"))
 
 			seq++
-			send(conn, peer, reply)
+			// send to the current raddr, not to a cached peer
+			_, err := conn.WriteToUDP(reply, raddr)
+			if err != nil {
+				log.Printf("write err: %v", err)
+			} else if os.Getenv("NOHEX") == "" {
+				log.Printf("→ sent (to %v) len=%d hex=%s", raddr, len(reply), strings.ToUpper(hex.EncodeToString(reply)))
+			}
+			// NOTE: do NOT lock peer yet; wait until we receive a unicast Join Request (3)
 
 		case MT_JOIN_REQ:
 			reply := buildSimpleResponse(MT_JOIN_RESP, seq, useLE)
 			seq++
+			peer = raddr
 			send(conn, peer, reply)
 
 		case MT_CFGSTAT_REQ:
