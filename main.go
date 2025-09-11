@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -317,9 +318,14 @@ func main() {
 		}
 
 		log.Printf("← from %v msg_type=%d len=%d", raddr, mt, n)
+		log.Printf("Payload (hex): %x\n", payload)
+		log.Printf("Payload (bytes): %v\n", payload)
+		log.Printf("DTLS :%v", isDTLS(payload))
 
 		switch mt {
 		case MT_DISCOVERY_REQ:
+			log.Println("Masuk ke MT_DISCOVERY_REQ")
+			parseDiscoveryRequest(payload)
 			//reply := buildSimpleResponse(MT_DISCOVERY_RESP, seq, useLE)
 			reply := buildDiscoveryResponse(seq, useLE, net.ParseIP("172.16.1.1"))
 
@@ -334,12 +340,14 @@ func main() {
 			// NOTE: do NOT lock peer yet; wait until we receive a unicast Join Request (3)
 
 		case MT_JOIN_REQ:
+			log.Println("Masuk ke MT_JOIN_REQ")
 			reply := buildSimpleResponse(MT_JOIN_RESP, seq, useLE)
 			seq++
 			peer = raddr
 			send(conn, peer, reply)
 
 		case MT_CFGSTAT_REQ:
+			log.Println("Masuk ke MT_CFGSTAT_REQ")
 			// Send 6, then 7
 			resp6 := buildSimpleResponse(MT_CFGSTAT_RESP, seq, useLE)
 			seq++
@@ -352,6 +360,7 @@ func main() {
 			send(conn, peer, cfg7)
 
 		case MT_ECHO_REQ:
+			log.Println("Masuk ke MT_ECHO_REQ")
 			resp10 := buildSimpleResponse(MT_ECHO_RESP, seq, useLE)
 			seq++
 			send(conn, peer, resp10)
@@ -376,19 +385,32 @@ func send(c *net.UDPConn, addr *net.UDPAddr, pkt []byte) {
 	}
 }
 
-// Heuristic: CAPWAP 12B header, then control header 8B; msg type is 4th byte of control header (00 00 00 <type>)
+func isDTLS(payload []byte) bool {
+	// Check for DTLS
+	if len(payload) >= 13 && payload[0] >= 20 && payload[0] <= 23 &&
+		payload[1] == 0xFE && (payload[2] == 0xFD || payload[2] == 0xFF) {
+		log.Println("Detected DTLS packet")
+		log.Printf("Content Type: %d\n", payload[0])
+		log.Printf("Version: %x\n", payload[1:3])
+		if payload[0] == 22 && len(payload) >= 14 && payload[13] == 1 {
+			log.Println("DTLS Handshake: ClientHello")
+		}
+		return true
+	}
+	log.Println("Not a DTLS packet")
+
+	return false
+}
+
 func guessMsgType(b []byte) (uint8, bool) {
-	if len(b) < 20 {
+	if len(b) < 12 {
 		return 0, false
 	}
-	// try 12+8
-	if len(b) >= 20 {
-		mt := b[12+3]
-		if mt > 0 && mt < 64 {
-			return mt, true
-		}
+	mt := b[11] // Byte terakhir dari Message Type (offset 11)
+	if mt > 0 && mt < 64 {
+		return mt, true
 	}
-	// try some fallbacks (8, 16, 24..)
+	// Fallback loop (jika diperlukan)
 	for off := 8; off <= 32; off += 4 {
 		if len(b) >= off+4 {
 			mt := b[off+3]
@@ -398,4 +420,58 @@ func guessMsgType(b []byte) (uint8, bool) {
 		}
 	}
 	return 0, false
+}
+
+func parseDiscoveryRequest(payload []byte) {
+	if len(payload) < 12 {
+		fmt.Println("Payload too short for CAPWAP")
+		return
+	}
+	preamble := payload[0]
+	messageType := binary.BigEndian.Uint32(payload[8:12])
+	mt, ok := guessMsgType(payload)
+	if preamble == 0x10 && messageType == 1 && mt == 1 && ok {
+		fmt.Println("CAPWAP Discovery Request detected")
+	} else {
+		fmt.Printf("Not a CAPWAP Discovery Request: Preamble=%x, MessageType=%d, guessMsgType=%d\n", preamble, messageType, mt)
+		return
+	}
+
+	// Parsing Message Elements
+	offset := 16
+	for offset < len(payload) {
+		if offset+4 > len(payload) {
+			break
+		}
+		elemType := binary.BigEndian.Uint16(payload[offset : offset+2])
+		elemLength := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
+		if offset+4+int(elemLength) > len(payload) {
+			break
+		}
+		value := payload[offset+4 : offset+4+int(elemLength)]
+		switch elemType {
+		case 1: // Discovery Type
+			if len(value) >= 1 {
+				fmt.Printf("Discovery Type: %d (0=Unknown, 1=DHCP, 2=DNS)\n", value[0])
+			}
+		case 21: // WTP Software Version
+			fmt.Printf("WTP Software Version: %s\n", string(value))
+		case 38: // WTP Descriptor
+			if len(value) >= 18 {
+				mac := string(value[8:27]) // MAC sebagai string ASCII
+				fmt.Printf("WTP Descriptor MAC: %s\n", mac)
+			}
+		case 39: // WTP Board Data
+			if len(value) >= 16 {
+				model := string(value[9:100])
+				fmt.Printf("WTP Board Data Model: %s\n", model)
+			}
+		case 2: // WTP Hardware Address
+			if len(value) >= 18 {
+				mac := string(value[0:18])
+				fmt.Printf("WTP Hardware Address: %s\n", mac)
+			}
+		}
+		offset += 4 + int(elemLength)
+	}
 }
